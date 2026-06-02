@@ -4,6 +4,8 @@
 # Flags queued/held jobs that may never run, especially jobs requesting host/vnode
 # names that do not exist in the current freenodes -gco node list.
 
+#NODE_DISCOVERY_COMMAND="freenodes -gco | tail -n +2 | grep -v -i 'offline' | awk '{print $1}'"
+
 set -u
 set -o pipefail
 
@@ -105,7 +107,8 @@ load_cluster_nodes() {
             {
                 node=$1
                 gsub(/[,;:]+$/, "", node)
-                if (node != "" && node !~ /^[#]/ && node !~ /^(node|host|vnode)$/i) print node
+                # if (node != "" && node !~ /^[#]/ && node !~ /^(node|host|vnode)$/i) print node
+                if (node != "" && node !~ /^#/ && tolower(node) !~ /^(node|host|vnode)$/) print node
             }
         ' |
         sort -u
