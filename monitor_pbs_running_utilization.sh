@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 # monitor_pbs_running_utilization.sh
-# Monitor CPU and memory utilization of running PBS/OpenPBS jobs using qstat -fx.
+# Monitor CPU and memory utilization of running PBS/OpenPBS jobs.
 #
-# Main checks:
-#   - resources_used.cpupercent compared with requested Resource_List.ncpus
-#   - resources_used.mem compared with requested Resource_List.mem or exec_vnode mem
+# Workflow:
+#   1. qstat            -> list job IDs and pick the ones in state R
+#   2. qstat -fx <id>   -> pull full per-job detail and parse it
 #
 # CPU logic:
-#   PBS cpupercent is usually percent of one CPU core.
-#   A job using 32 cores fully should report about 3200 cpupercent.
-#   CPU utilization percent of allocation = cpupercent / (ncpus * 100) * 100.
+#   PBS cpupercent is percent of one CPU core.
+#   A job using 8 cores fully reports about 800 cpupercent.
+#   cpu_util_percent = resources_used.cpupercent / requested_ncpus
+#
+# Mem logic:
+#   mem_util_percent = resources_used.mem / Resource_List.mem * 100
 #
 # Examples:
 #   ./monitor_pbs_running_utilization.sh
 #   ./monitor_pbs_running_utilization.sh -v
-#   ./monitor_pbs_running_utilization.sh --low-cpu 20 --high-mem 90
-#   ./monitor_pbs_running_utilization.sh --user hadassah.griffin
+#   ./monitor_pbs_running_utilization.sh --low-cpu 50 --high-mem 90
+#   ./monitor_pbs_running_utilization.sh --user yiting.song
 #   ./monitor_pbs_running_utilization.sh --csv running_jobs.csv
-#   ./monitor_pbs_running_utilization.sh --job 681910.bright04
+#   ./monitor_pbs_running_utilization.sh --job 687593.bright04
 
 set -o pipefail
 
@@ -37,13 +40,14 @@ show_help() {
     cat <<'HELP'
 Usage: monitor_pbs_running_utilization.sh [OPTIONS]
 
-Checks running PBS jobs using qstat -fx and reports low CPU or high memory usage.
+Lists running PBS jobs with qstat, reads each with qstat -fx, and reports
+low CPU or high memory usage relative to what each job requested.
 
 OPTIONS:
     -h, --help                  Show this help message
     -v, --verbose               Show detailed job information
     --show-ok                   Also print jobs that do not cross thresholds
-    --problems-only             Print only jobs crossing thresholds; default summary already focuses on problems
+    --problems-only             Print only jobs crossing thresholds
     --low-cpu PERCENT           Flag jobs below this CPU utilization of requested ncpus [default: 20]
     --high-mem PERCENT          Flag jobs above this memory utilization of requested mem [default: 90]
     --low-mem PERCENT           Optional: flag jobs below this memory utilization of requested mem
@@ -53,20 +57,9 @@ OPTIONS:
     --csv FILE                  Write CSV report to FILE
     --no-header                 Do not print the table header
 
-EXAMPLES:
-    ./monitor_pbs_running_utilization.sh
-    ./monitor_pbs_running_utilization.sh -v
-    ./monitor_pbs_running_utilization.sh --low-cpu 10 --high-mem 95
-    ./monitor_pbs_running_utilization.sh --user hadassah.griffin
-    ./monitor_pbs_running_utilization.sh --job 681910.bright04
-    ./monitor_pbs_running_utilization.sh --csv running_jobs.csv
-
 NOTES:
-    CPU percent interpretation:
-      cpu_util_percent = resources_used.cpupercent / (requested_ncpus * 100) * 100
-
-    Example:
-      cpupercent=3023 and ncpus=32 means about 94.5% of the requested CPU allocation.
+    cpu_util_percent = resources_used.cpupercent / requested_ncpus
+    Example: cpupercent=393 and ncpus=8 -> about 49.1% of the CPU allocation.
 HELP
 }
 
@@ -138,7 +131,7 @@ while [[ $# -gt 0 ]]; do
             exit 1
             ;;
     esac
- done
+done
 
 require_cmd() {
     command -v "$1" >/dev/null 2>&1 || { err "Required command not found: $1"; exit 1; }
@@ -149,8 +142,7 @@ require_cmd awk
 require_cmd sed
 require_cmd date
 
-# Convert PBS memory value to KB.
-# Supports kb, mb, gb, tb, bare numbers treated as KB.
+# Convert PBS memory value to KB. Supports kb, mb, gb, tb; bare numbers are KB.
 mem_to_kb() {
     local raw="$1"
     raw=$(echo "$raw" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
@@ -170,6 +162,7 @@ mem_to_kb() {
             else if (unit == "mb" || unit == "m") mult = 1024
             else if (unit == "gb" || unit == "g") mult = 1024 * 1024
             else if (unit == "tb" || unit == "t") mult = 1024 * 1024 * 1024
+            else if (unit == "b") mult = 1 / 1024
             else mult = 1
             printf "%.0f\n", n * mult
         }'
@@ -188,14 +181,16 @@ time_to_minutes() {
         }'
 }
 
-# Join qstat continuation lines. PBS often wraps long attributes onto a tab-indented next line.
+# Fold qstat -fx continuation lines back onto their attribute.
+# In PBS output, attribute lines are indented with spaces and a wrapped
+# value continues on the next line indented with a TAB. Only tab-indented
+# lines are continuations, so we join those and leave attribute lines intact.
 normalize_qstat() {
     awk '
-        /^[[:space:]]/ {
+        /^\t/ {
             line = $0
             sub(/^[[:space:]]+/, "", line)
-            if (current != "") current = current line
-            else current = line
+            current = current line
             next
         }
         {
@@ -210,7 +205,7 @@ get_attr() {
     local data="$1"
     local key="$2"
     echo "$data" | awk -v key="$key" '
-        index($0, key " = ") == 5 {
+        index($0, "    " key " = ") == 1 {
             sub("^    " key " = ", "")
             print
             exit
@@ -226,7 +221,7 @@ get_job_id_from_data() {
 extract_exec_vnode_mem_kb() {
     local exec_vnode="$1"
     local mem
-    mem=$(echo "$exec_vnode" | grep -oE 'mem=[0-9]+[a-zA-Z]*' | head -n 1 | sed 's/^mem=//')
+    mem=$(echo "$exec_vnode" | grep -oiE 'mem=[0-9]+[a-zA-Z]*' | head -n 1 | sed 's/^[Mm][Ee][Mm]=//')
     if [[ -n "$mem" ]]; then
         mem_to_kb "$mem"
     else
@@ -241,13 +236,13 @@ csv_escape() {
 }
 
 print_header() {
-    printf '%-18s %-22s %-18s %-10s %-8s %-10s %-10s %-9s %-9s %-s\n' \
+    printf '%-18s %-22s %-20s %-12s %-6s %-8s %-8s %-9s %-9s %-s\n' \
         "JOB_ID" "OWNER" "NAME" "QUEUE" "NCPUS" "CPU%" "MEM%" "WALL" "STATUS" "REASONS"
 }
 
 print_row() {
     local job_id="$1" owner="$2" name="$3" queue="$4" ncpus="$5" cpu_util="$6" mem_util="$7" walltime="$8" status="$9" reasons="${10}"
-    printf '%-18s %-22s %-18s %-10s %-8s %-10s %-10s %-9s %-9s %-s\n' \
+    printf '%-18s %-22s %-20s %-12s %-6s %-8s %-8s %-9s %-9s %-s\n' \
         "$job_id" "$owner" "$name" "$queue" "$ncpus" "$cpu_util" "$mem_util" "$walltime" "$status" "$reasons"
 }
 
@@ -277,17 +272,21 @@ write_csv_row() {
     } >> "$CSV_FILE"
 }
 
+# List running job IDs using qstat. Columns of default qstat:
+#   Job id  Name  User  Time-Use  S  Queue
+# We skip the two header lines, keep rows whose state column is R, and
+# optionally filter by the User column.
 get_running_jobs() {
     if [[ -n "$JOB_ID" ]]; then
         echo "$JOB_ID"
         return
     fi
 
-    if [[ -n "$USER_FILTER" ]]; then
-        qselect -s R -u "$USER_FILTER" 2>/dev/null || true
-    else
-        qselect -s R 2>/dev/null || true
-    fi
+    qstat 2>/dev/null | awk -v user="$USER_FILTER" '
+        NR > 2 && $5 == "R" {
+            if (user == "" || $3 == user) print $1
+        }
+    '
 }
 
 process_job() {
@@ -351,23 +350,20 @@ process_job() {
     reasons=""
 
     if [[ "$cpu_util" != "NA" ]]; then
-        awk -v v="$cpu_util" -v t="$LOW_CPU_THRESHOLD" 'BEGIN { exit !(v < t) }'
-        if [[ $? -eq 0 ]]; then
+        if awk -v v="$cpu_util" -v t="$LOW_CPU_THRESHOLD" 'BEGIN { exit !(v < t) }'; then
             status="PROBLEM"
             reasons+="LOW_CPU(${cpu_util}%<${LOW_CPU_THRESHOLD}%) "
         fi
     fi
 
     if [[ "$mem_util" != "NA" ]]; then
-        awk -v v="$mem_util" -v t="$HIGH_MEM_THRESHOLD" 'BEGIN { exit !(v > t) }'
-        if [[ $? -eq 0 ]]; then
+        if awk -v v="$mem_util" -v t="$HIGH_MEM_THRESHOLD" 'BEGIN { exit !(v > t) }'; then
             status="PROBLEM"
             reasons+="HIGH_MEM(${mem_util}%>${HIGH_MEM_THRESHOLD}%) "
         fi
 
         if [[ -n "$LOW_MEM_THRESHOLD" ]]; then
-            awk -v v="$mem_util" -v t="$LOW_MEM_THRESHOLD" 'BEGIN { exit !(v < t) }'
-            if [[ $? -eq 0 ]]; then
+            if awk -v v="$mem_util" -v t="$LOW_MEM_THRESHOLD" 'BEGIN { exit !(v < t) }'; then
                 status="PROBLEM"
                 reasons+="LOW_MEM(${mem_util}%<${LOW_MEM_THRESHOLD}%) "
             fi
