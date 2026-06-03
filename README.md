@@ -1,4 +1,4 @@
-# monitor_pbs_stuck_jobs.sh
+# [1] monitor_pbs_stuck_jobs.sh
 
 Read-only checker for PBS Pro / OpenPBS that flags **queued** and **held** jobs needing
 attention — above all, queued jobs that can **never** run because they ask for a node name
@@ -66,7 +66,7 @@ request.
 (with `--exit-nonzero`).
 
 
-# monitor_pbs_running_utilization.sh
+# [2] monitor_pbs_running_utilization.sh
 
 Finds running PBS / OpenPBS jobs that waste resources — jobs leaving most of their CPU cores idle, or running near their memory limit. Read-only: it only reads `qstat`, never changes jobs.
 
