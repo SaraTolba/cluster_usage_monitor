@@ -1,120 +1,135 @@
-# [1] monitor_pbs_stuck_jobs.sh
+# PBS Cluster Usage Monitor
 
-Read-only checker for PBS Pro / OpenPBS that flags **queued** and **held** jobs needing
-attention — above all, queued jobs that can **never** run because they ask for a node name
-or a per-node resource amount the cluster cannot provide.
+Two read-only command-line checks for PBS Pro / OpenPBS clusters:
 
-It only reads cluster state (`qstat`, `qselect`, `freenodes -gco`). It never holds,
-releases, deletes, or modifies jobs.
+| Script | Purpose |
+|---|---|
+| `monitor_pbs_stuck_jobs.sh` | Finds queued and held jobs that likely require user or administrator attention. |
+| `monitor_pbs_running_utilization.sh` | Finds running jobs with low CPU use or unusually high/low memory use relative to their requests. |
 
-## What it flags
+Neither script holds, releases, deletes, or otherwise changes jobs. They query PBS with `qstat` (and, for the stuck-job check, `qselect`) and print a report.
 
-- **Nonexistent nodes** — a `host=`/`vnode=` in `Resource_List.select` that no node matches.
-- **Unsatisfiable resources** — a `select` chunk whose `ncpus`/`mem`/`ngpus`/`gpu_type` no
-  *single* node can satisfy (e.g. `ncpus=200` when the largest node has 192 cores). These are
-  marked `CONTACT USER`.
-- **Held jobs** — listed for review.
+## Quick start
 
-Feasibility is checked per chunk against one node's **total** capacity (not free, so "can it
-ever run"), and is conservative: unparseable selects and ranges like `host=node[001-003]`
-are skipped, never guessed.
-
-## Requirements
-
-`bash`, `qstat`, `qselect`, a node-inventory command (`freenodes -gco` by default), and the
-usual `awk`/`grep`/`sort`/`cut`/`mktemp`/`date`. Works with gawk or mawk. The `--days` filter
-needs GNU `date`.
-
-## Install
+The scripts are executable in this repository. Run them on a host where the PBS client commands and, for the stuck-job check, the site node-inventory command are available.
 
 ```bash
-chmod +x monitor_pbs_stuck_jobs.sh
+./monitor_pbs_stuck_jobs.sh
+./monitor_pbs_running_utilization.sh
 ```
 
-## Usage
+If the executable bits are lost after copying the files:
 
 ```bash
-monitor_pbs_stuck_jobs.sh            # check held + queued (default)
-monitor_pbs_stuck_jobs.sh -Q -d 7 -v # queued only, older than 7 days, verbose
-monitor_pbs_stuck_jobs.sh --exit-nonzero --show-all-problem-jobs > report.txt
+chmod +x monitor_pbs_stuck_jobs.sh monitor_pbs_running_utilization.sh
+```
+
+## Stuck queued and held jobs
+
+`monitor_pbs_stuck_jobs.sh` checks queued (`Q`) and held (`H`) jobs by default.
+
+For queued jobs, it compares each `Resource_List.select` request with the node inventory from `freenodes -gco` and flags:
+
+- explicit `host=` or `vnode=` names that do not exist;
+- a per-chunk `ncpus`, `mem`, `ngpus`, or `gpu_type` request that no single node can provide;
+- scheduler comments suggesting a resource problem, only when `--check-comments` is requested.
+
+The capacity check uses each node's total capacity—not current free capacity—so it answers whether the request can ever fit. Requests using unexpanded node ranges, such as `node[001-003]`, are skipped rather than guessed.
+
+Held jobs are classified rather than automatically treated as stuck:
+
+- user, operator, and password holds are actionable;
+- system holds without a dependency are flagged for investigation;
+- dependency holds whose parent is missing or completed in a way that can never satisfy `afterok`/`afternotok` are flagged;
+- dependency holds waiting on a parent that is still present are reported as normal and are not counted as problems.
+
+### Usage
+
+```bash
+./monitor_pbs_stuck_jobs.sh                         # queued and held jobs
+./monitor_pbs_stuck_jobs.sh -Q -d 7 -v              # queued jobs at least 7 days old
+./monitor_pbs_stuck_jobs.sh -H --include-normal-holds
+./monitor_pbs_stuck_jobs.sh --exit-nonzero > report.txt
 ```
 
 | Option | Description |
 |---|---|
-| `-Q` / `-H` | Queued-only / held-only |
-| `-v` | Verbose per-job diagnostics |
-| `-d DAYS` | Only jobs older than `DAYS` (by `qtime`) |
-| `--freenodes-cmd CMD` | Override node-inventory command (same column layout required) |
-| `--exit-nonzero` | Exit `2` if anything is flagged (for cron/alerting) |
-| `--check-comments` | Also flag scheduler resource comments (off by default — noisy) |
-| `--show-all-problem-jobs` | Don't truncate the list at 25 |
-| `-h` | Help |
+| `-Q`, `--queued-only` | Inspect queued jobs only. |
+| `-H`, `--held-only` | Inspect held jobs only. |
+| `-d DAYS`, `--days DAYS` | Inspect only jobs at least `DAYS` old, based on `qtime`. |
+| `-v`, `--verbose` | Show detailed PBS attributes for flagged jobs. |
+| `--freenodes-cmd CMD` | Use another node-inventory command with the same column layout as `freenodes -gco`. |
+| `--check-comments` | Include scheduler resource comments; this can be noisy for jobs merely waiting on busy resources. |
+| `--include-normal-holds` | Print normal dependency holds for review. |
+| `--skip-dep-parent-check` | Do not query dependency parents; treats dependency holds as normal. |
+| `--show-all-problem-jobs` | Do not limit the summary's problem-job list to 25 entries. |
+| `--exit-nonzero` | Exit with status 2 when actionable jobs are found. |
+| `-h`, `--help` | Show full help. |
 
-## Example
+Example finding:
 
-```
+```text
 648053.bright04 [QUEUED] - unsatisfiable resources -> CONTACT USER: chunk 1 (ngpus=8 > max per-node 2)
-648045.bright04 [QUEUED] - requested node(s) not found in freenodes: gpu0059
 ```
 
-`chunk N` is the Nth `+`-separated part of the job's `select`; run with `-v` to see the full
-request.
+## Running-job utilization
 
-## Exit codes
+`monitor_pbs_running_utilization.sh` lists running (`R`) jobs, reads each with `qstat -fx`, and evaluates CPU and memory use against the requested allocation.
 
-`0` ok · `1` setup error (missing command, no nodes parsed, bad args) · `2` problems found
-(with `--exit-nonzero`).
-
-
-# [2] monitor_pbs_running_utilization.sh
-
-Finds running PBS / OpenPBS jobs that waste resources — jobs leaving most of their CPU cores idle, or running near their memory limit. Read-only: it only reads `qstat`, never changes jobs.
-
-## How it works
-
-Runs `qstat` to list running (`R`) jobs, reads each with `qstat -fx`, and computes:
-
-```
-cpu_util% = resources_used.cpupercent / Resource_List.ncpus      # 393 / 8 ≈ 49%
-mem_util% = resources_used.mem / Resource_List.mem * 100
+```text
+CPU utilization (%) = resources_used.cpupercent / Resource_List.ncpus
+Memory utilization (%) = resources_used.mem / Resource_List.mem * 100
 ```
 
-A job is flagged `PROBLEM` if CPU is below `--low-cpu` (default 20%) or memory is above `--high-mem` (default 90%).
+PBS reports `cpupercent` as a percentage of one CPU core; for example, `cpupercent=393` on an 8-core allocation is about 49.1% of the allocation. If `Resource_List.mem` is unavailable, the script falls back to the memory value in `exec_vnode`.
 
-## Usage
+By default, only jobs flagged as `PROBLEM` are printed:
 
-```
-chmod +x monitor_pbs_running_utilization.sh
-./monitor_pbs_running_utilization.sh [OPTIONS]
-```
+- CPU use below 20% of requested cores;
+- memory use above 90% of requested memory.
 
-By default it prints **only the flagged jobs**, across all users. No rows = all healthy; `No running jobs found.` = nothing running.
+The default 10-minute minimum walltime avoids alerting on newly started jobs. A missing table row means no job met the selected reporting criteria; `No running jobs found.` means PBS reported no running jobs.
 
-### Key options
+### Usage
 
-- `--show-ok` — also show healthy jobs
-- `--low-cpu N` / `--high-mem N` — set thresholds (e.g. `--low-cpu 50`)
-- `--low-mem N` — also flag jobs using less than N% of requested memory
-- `--min-walltime MIN` — skip jobs younger than this (default 10)
-- `--user NAME` — limit to one user
-- `--job JOBID` — check a single job
-- `--csv FILE` — write a full report (all jobs) to CSV
-- `-v` — per-job detail; `-h` — full help
-
-### Examples
-
-```
-./monitor_pbs_running_utilization.sh                       # current offenders
-./monitor_pbs_running_utilization.sh --show-ok             # everything
-./monitor_pbs_running_utilization.sh --low-cpu 50          # flag half-idle jobs
-./monitor_pbs_running_utilization.sh --user yiting.song -v
+```bash
+./monitor_pbs_running_utilization.sh
+./monitor_pbs_running_utilization.sh --show-ok
+./monitor_pbs_running_utilization.sh --low-cpu 50 --high-mem 85
+./monitor_pbs_running_utilization.sh --low-mem 10 --user yiting.song -v
+./monitor_pbs_running_utilization.sh --job 687593.bright04
 ./monitor_pbs_running_utilization.sh --csv running_jobs.csv
 ```
 
-## Requirements
+| Option | Description |
+|---|---|
+| `--show-ok` | Include jobs that do not cross a threshold. |
+| `--problems-only` | Print only threshold violations (the default behavior). |
+| `--low-cpu PERCENT` | Flag CPU utilization below this value; default `20`. |
+| `--high-mem PERCENT` | Flag memory utilization above this value; default `90`. |
+| `--low-mem PERCENT` | Also flag memory utilization below this value. |
+| `--min-walltime MINUTES` | Ignore jobs younger than this runtime; default `10`. |
+| `--user USERNAME` | Limit the scan to a job owner. |
+| `--job JOBID` | Inspect one running job. |
+| `--csv FILE` | Write a CSV report for every processed running job, including jobs not printed to the terminal. |
+| `--no-header` | Omit the terminal table header. |
+| `-v`, `--verbose` | Print raw utilization details for displayed jobs. |
+| `-h`, `--help` | Show full help. |
 
-PBS/OpenPBS with `qstat` on `PATH`, plus `awk`, `sed`, `date`. Assumes the standard `qstat -fx` format (4-space attribute indent, tab-wrapped continuation lines).
+## Requirements and compatibility
 
-## Caveats
+Both scripts need Bash, `qstat`, `awk`, `sed`, and `date`. The stuck-job checker also needs `qselect`, `freenodes -gco` (or an equivalent supplied with `--freenodes-cmd`), `grep`, `sort`, `cut`, `tr`, and `mktemp`.
 
-Default `qstat` may truncate very long job IDs. For multi-node jobs, `mem%` can read high if `Resource_List.mem` is per-chunk. Treat flags as hints, not verdicts — tune the thresholds to your cluster.
+The scripts expect the standard PBS `qstat -fx` attribute format, including space-indented attributes and tab-indented wrapped continuations. The stuck-job checker supports gawk and mawk. Its `--days` filter uses GNU `date -d`; on macOS, run it in an environment that provides GNU date.
+
+For multi-node jobs, treat the running-job memory percentage as a diagnostic signal rather than a final accounting value: `Resource_List.mem` can represent a per-chunk request while the usage value may be aggregated differently by the site configuration. Tune thresholds to the cluster and workload.
+
+## Exit status
+
+`monitor_pbs_stuck_jobs.sh` returns:
+
+- `0` for a completed check, including when problems are found unless `--exit-nonzero` is set;
+- `1` for setup, command, inventory, or argument errors;
+- `2` when `--exit-nonzero` is set and one or more actionable jobs are found.
+
+The running-utilization script returns a nonzero status for invalid arguments or missing required commands; threshold violations are reported in its output rather than through a dedicated exit status.
